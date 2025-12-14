@@ -1,13 +1,11 @@
-import os
+# @title 📡 Updated Server Code (app.py)
+
+server_code = '''import os
 import secrets
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, text
 import requests as http_requests
-
-# Google Auth imports for ID Token verification
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_auth_requests
 
 app = Flask(__name__)
 
@@ -22,9 +20,6 @@ else:
     print("⚠️ WARNING: DATABASE_URL not set. Using temporary local SQLite.")
     engine = create_engine("sqlite:///temp.db")
 
-# --- OPTIONAL: Set your Google Client ID for stricter verification ---
-# If you have a GCP project, set this. Otherwise, leave as None for general verification.
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", None)
 
 def init_db():
     with engine.connect() as conn:
@@ -32,95 +27,71 @@ def init_db():
             CREATE TABLE IF NOT EXISTS licenses (
                 key_code TEXT PRIMARY KEY,
                 status TEXT DEFAULT 'unused',
-                duration_hours INT DEFAULT 24
+                duration_hours INT DEFAULT 24,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS active_sessions (
                 user_email TEXT PRIMARY KEY,
-                expires_at TIMESTAMP
+                expires_at TIMESTAMP,
+                last_key TEXT,
+                activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
         conn.commit()
 
 init_db()
 
-def verify_google_token(token, token_type="access_token"):
+
+def verify_google_token(token):
     """
-    Verifies a Google token and returns the user's email.
-    
-    Supports two verification methods:
-    1. access_token: Verifies via Google's userinfo API
-    2. id_token: Cryptographic verification (more secure)
-    
-    Returns: (email, error_message)
+    Verify Google access token and return email.
+    Returns: (email, error)
     """
-    
-    if token_type == "id_token":
-        # Method 1: Cryptographic ID Token Verification (Preferred)
-        try:
-            # Verify the ID token
-            idinfo = id_token.verify_oauth2_token(
-                token,
-                google_auth_requests.Request(),
-                GOOGLE_CLIENT_ID  # Can be None for general verification
-            )
-            
-            # Check if email is verified
-            if not idinfo.get('email_verified', False):
-                return None, "Email not verified by Google"
-            
-            email = idinfo.get('email')
-            if not email:
-                return None, "No email in token"
-                
-            return email, None
-            
-        except ValueError as e:
-            return None, f"Invalid ID token: {str(e)}"
-        except Exception as e:
-            return None, f"Token verification failed: {str(e)}"
-    
-    else:
-        # Method 2: Access Token Verification via Google API
-        try:
-            # Verify access token with Google's userinfo endpoint
-            response = http_requests.get(
-                "https://www.googleapis.com/oauth2/v2/userinfo",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10
-            )
-            
-            if response.status_code != 200:
-                # Try tokeninfo as fallback
-                response = http_requests.get(
-                    f"https://oauth2.googleapis.com/tokeninfo?access_token={token}",
-                    timeout=10
-                )
-                if response.status_code != 200:
-                    return None, "Invalid access token"
-            
+    try:
+        # Method 1: userinfo endpoint
+        response = http_requests.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
             user_info = response.json()
             email = user_info.get('email')
-            
-            if not email:
-                return None, "Could not retrieve email from token"
-            
-            # Optional: Check if email is verified
-            if user_info.get('verified_email') == False:
-                return None, "Email not verified"
-                
-            return email, None
-            
-        except http_requests.RequestException as e:
-            return None, f"Network error during verification: {str(e)}"
-        except Exception as e:
-            return None, f"Token verification failed: {str(e)}"
+            if email:
+                return email, None
+        
+        # Method 2: tokeninfo endpoint (fallback)
+        response = http_requests.get(
+            f"https://oauth2.googleapis.com/tokeninfo?access_token={token}",
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            email = data.get('email')
+            if email:
+                return email, None
+            return None, "No email in token"
+        
+        return None, f"Token validation failed (status {response.status_code})"
+        
+    except http_requests.exceptions.Timeout:
+        return None, "Google API timeout"
+    except Exception as e:
+        return None, f"Verification error: {str(e)}"
 
 
 @app.route('/')
 def home():
-    return "License Server is Online. (Google Token Verification Enabled)"
+    return jsonify({
+        "status": "online",
+        "service": "License Server",
+        "endpoints": ["/api/authorize", "/api/status", "/admin"]
+    })
+
 
 # --- ADMIN PANEL ---
 @app.route('/admin')
@@ -128,144 +99,246 @@ def admin_ui():
     return """
     <!DOCTYPE html>
     <html>
-    <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-        <h1>🔑 Key Generator</h1>
-        <label>Duration (hours): <input type="number" id="duration" value="24" min="1"></label><br><br>
-        <button onclick="generate()" style="padding: 10px 20px;">Generate Key</button>
-        <p id="result" style="font-family: monospace; font-size: 20px; font-weight: bold;"></p>
+    <head>
+        <title>License Admin</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+            .card { background: #f5f5f5; padding: 20px; border-radius: 10px; margin: 20px 0; }
+            input, button { padding: 10px 15px; margin: 5px; font-size: 16px; }
+            button { background: #4CAF50; color: white; border: none; cursor: pointer; border-radius: 5px; }
+            button:hover { background: #45a049; }
+            .key { font-family: monospace; font-size: 24px; background: #e0e0e0; padding: 15px; border-radius: 5px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+            th { background: #4CAF50; color: white; }
+        </style>
+    </head>
+    <body>
+        <h1>🔑 License Key Generator</h1>
+        
+        <div class="card">
+            <h3>Generate New Key</h3>
+            <label>Duration (hours): <input type="number" id="duration" value="24" min="1"></label>
+            <button onclick="generateKey()">Generate Key</button>
+            <div id="newKey" class="key" style="display:none; margin-top:15px;"></div>
+        </div>
+        
+        <div class="card">
+            <h3>📋 Recent Keys</h3>
+            <button onclick="loadKeys()">Refresh</button>
+            <table id="keysTable">
+                <thead><tr><th>Key</th><th>Status</th><th>Duration</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+        
+        <div class="card">
+            <h3>👥 Active Sessions</h3>
+            <button onclick="loadSessions()">Refresh</button>
+            <table id="sessionsTable">
+                <thead><tr><th>Email</th><th>Expires</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+        
         <script>
-            async function generate() {
+            async function generateKey() {
                 const duration = document.getElementById('duration').value;
-                const res = await fetch('/admin/create', { 
+                const res = await fetch('/admin/create', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({duration: parseInt(duration)})
                 });
                 const data = await res.json();
-                document.getElementById('result').innerText = data.key;
+                const keyDiv = document.getElementById('newKey');
+                keyDiv.innerText = data.key;
+                keyDiv.style.display = 'block';
+                loadKeys();
             }
+            
+            async function loadKeys() {
+                const res = await fetch('/admin/keys');
+                const data = await res.json();
+                const tbody = document.querySelector('#keysTable tbody');
+                tbody.innerHTML = data.keys.map(k => 
+                    `<tr><td><code>${k.key}</code></td><td>${k.status}</td><td>${k.hours}h</td></tr>`
+                ).join('');
+            }
+            
+            async function loadSessions() {
+                const res = await fetch('/admin/sessions');
+                const data = await res.json();
+                const tbody = document.querySelector('#sessionsTable tbody');
+                tbody.innerHTML = data.sessions.map(s => 
+                    `<tr><td>${s.email}</td><td>${s.expires}</td></tr>`
+                ).join('');
+            }
+            
+            loadKeys();
+            loadSessions();
         </script>
     </body>
     </html>
     """
 
+
 @app.route('/admin/create', methods=['POST'])
-def create_key_api():
+def create_key():
     data = request.json or {}
     duration = data.get('duration', 24)
-    key = secrets.token_hex(8)
+    key = secrets.token_hex(8).upper()
+    
     with engine.connect() as conn:
         conn.execute(
-            text("INSERT INTO licenses (key_code, duration_hours) VALUES (:k, :d)"), 
+            text("INSERT INTO licenses (key_code, duration_hours) VALUES (:k, :d)"),
             {"k": key, "d": duration}
         )
         conn.commit()
+    
     return jsonify({"key": key, "duration_hours": duration})
 
-# --- AUTHORIZATION API (with Google Token Verification) ---
+
+@app.route('/admin/keys')
+def list_keys():
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT key_code, status, duration_hours FROM licenses ORDER BY created_at DESC LIMIT 50")
+        ).fetchall()
+    
+    return jsonify({
+        "keys": [{"key": r[0], "status": r[1], "hours": r[2]} for r in rows]
+    })
+
+
+@app.route('/admin/sessions')
+def list_sessions():
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT user_email, expires_at FROM active_sessions ORDER BY expires_at DESC")
+        ).fetchall()
+    
+    return jsonify({
+        "sessions": [{"email": r[0], "expires": str(r[1])} for r in rows]
+    })
+
+
+# --- AUTHORIZATION API ---
 @app.route('/api/authorize', methods=['POST'])
 def authorize():
     data = request.json or {}
     google_token = data.get('google_token')
-    token_type = data.get('token_type', 'access_token')  # 'access_token' or 'id_token'
     provided_key = data.get('key')
-
-    # --- STEP 1: Verify Google Token ---
+    
+    # Step 1: Verify Google Token
     if not google_token:
         return jsonify({
-            "authorized": False, 
+            "authorized": False,
             "error": "Google token required. Please authenticate with Google."
         }), 400
-
-    email, error = verify_google_token(google_token, token_type)
+    
+    email, error = verify_google_token(google_token)
     
     if error:
         return jsonify({
-            "authorized": False, 
+            "authorized": False,
             "error": f"Google verification failed: {error}"
         }), 403
     
-    print(f"✅ Verified Google user: {email}")
-
-    # --- STEP 2: Check License/Session ---
+    print(f"✅ Verified: {email}")
+    
     with engine.connect() as conn:
-        # Check if user has an active session
+        # Step 2: Check existing session
         session = conn.execute(
             text("SELECT expires_at FROM active_sessions WHERE user_email = :e"),
             {"e": email}
         ).fetchone()
-
+        
         if session:
             expires_at = session[0]
             if isinstance(expires_at, str):
                 expires_at = datetime.fromisoformat(expires_at)
             
             if datetime.now() < expires_at:
-                remaining = expires_at - datetime.now()
-                hours_left = remaining.total_seconds() / 3600
+                remaining = (expires_at - datetime.now()).total_seconds() / 3600
                 return jsonify({
-                    "authorized": True, 
-                    "message": "Session Valid",
+                    "authorized": True,
+                    "message": "Session valid",
                     "email": email,
-                    "hours_remaining": round(hours_left, 2)
+                    "hours_remaining": round(remaining, 2)
                 })
             else:
-                # Session expired, delete it
-                conn.execute(text("DELETE FROM active_sessions WHERE user_email = :e"), {"e": email})
+                # Expired - delete it
+                conn.execute(
+                    text("DELETE FROM active_sessions WHERE user_email = :e"),
+                    {"e": email}
+                )
                 conn.commit()
-
-        # --- STEP 3: If no active session, validate the License Key ---
+        
+        # Step 3: Need license key
         if not provided_key:
             return jsonify({
-                "authorized": False, 
-                "error": "Session expired or new user. License key required.",
+                "authorized": False,
+                "error": "No active license. Please enter a license key.",
                 "email": email,
                 "needs_key": True
             }), 401
-
+        
+        # Step 4: Validate license key
         row = conn.execute(
             text("SELECT status, duration_hours FROM licenses WHERE key_code = :k"),
-            {"k": provided_key}
+            {"k": provided_key.upper().strip()}
         ).fetchone()
-
+        
         if not row:
-            return jsonify({"authorized": False, "error": "Invalid license key"}), 403
+            return jsonify({
+                "authorized": False,
+                "error": "Invalid license key"
+            }), 403
         
         status, duration = row
-        if status == 'used':
-            return jsonify({"authorized": False, "error": "License key already used"}), 403
-
-        # --- STEP 4: Activate License ---
-        new_expiry = datetime.now() + timedelta(hours=duration)
-        conn.execute(text("UPDATE licenses SET status = 'used' WHERE key_code = :k"), {"k": provided_key})
         
-        # Upsert Session
-        conn.execute(text("DELETE FROM active_sessions WHERE user_email = :e"), {"e": email})
+        if status == 'used':
+            return jsonify({
+                "authorized": False,
+                "error": "License key already used"
+            }), 403
+        
+        # Step 5: Activate license
+        new_expiry = datetime.now() + timedelta(hours=duration)
+        
         conn.execute(
-            text("INSERT INTO active_sessions (user_email, expires_at) VALUES (:e, :t)"), 
-            {"e": email, "t": new_expiry}
+            text("UPDATE licenses SET status = 'used' WHERE key_code = :k"),
+            {"k": provided_key.upper().strip()}
+        )
+        conn.execute(
+            text("DELETE FROM active_sessions WHERE user_email = :e"),
+            {"e": email}
+        )
+        conn.execute(
+            text("""INSERT INTO active_sessions (user_email, expires_at, last_key) 
+                    VALUES (:e, :t, :k)"""),
+            {"e": email, "t": new_expiry, "k": provided_key.upper().strip()}
         )
         conn.commit()
-
+        
         return jsonify({
-            "authorized": True, 
+            "authorized": True,
             "message": f"License activated! Access granted for {duration} hours.",
             "email": email,
             "hours_remaining": duration
         })
 
-# --- STATUS CHECK ENDPOINT ---
+
 @app.route('/api/status', methods=['POST'])
 def check_status():
-    """Check license status without consuming a key"""
+    """Check license status without consuming a key."""
     data = request.json or {}
     google_token = data.get('google_token')
-    token_type = data.get('token_type', 'access_token')
     
     if not google_token:
         return jsonify({"error": "Google token required"}), 400
     
-    email, error = verify_google_token(google_token, token_type)
+    email, error = verify_google_token(google_token)
     
     if error:
         return jsonify({"error": f"Verification failed: {error}"}), 403
@@ -282,19 +355,54 @@ def check_status():
                 expires_at = datetime.fromisoformat(expires_at)
             
             if datetime.now() < expires_at:
-                remaining = expires_at - datetime.now()
+                remaining = (expires_at - datetime.now()).total_seconds() / 3600
                 return jsonify({
                     "has_license": True,
                     "email": email,
-                    "expires_at": expires_at.isoformat(),
-                    "hours_remaining": round(remaining.total_seconds() / 3600, 2)
+                    "hours_remaining": round(remaining, 2)
                 })
-        
-        return jsonify({
-            "has_license": False,
-            "email": email,
-            "message": "No active license"
-        })
+    
+    return jsonify({
+        "has_license": False,
+        "email": email,
+        "message": "No active license"
+    })
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+'''
+
+# Save to file
+with open('/content/app.py', 'w') as f:
+    f.write(server_code)
+
+# Also create requirements.txt
+requirements = """Flask
+psycopg2-binary
+sqlalchemy
+gunicorn
+requests
+"""
+
+with open('/content/requirements.txt', 'w') as f:
+    f.write(requirements)
+
+print("✅ Created: /content/app.py")
+print("✅ Created: /content/requirements.txt")
+print("\n📤 Uploading to download...")
+
+from google.colab import files
+files.download('/content/app.py')
+files.download('/content/requirements.txt')
+
+print("""
+📌 DEPLOY TO RENDER.COM:
+   
+   1. Create new Web Service on Render
+   2. Upload app.py and requirements.txt
+   3. Set environment variable: DATABASE_URL (use Render PostgreSQL)
+   4. Start command: gunicorn app:app
+   5. Copy your URL and update licenseguard.py!
+""")
